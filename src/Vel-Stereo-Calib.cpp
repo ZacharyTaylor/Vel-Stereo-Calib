@@ -13,11 +13,13 @@
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
-#include "opencv2/calib3d/calib3d.hpp"
+#include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
 #include <pcl/io/ply_io.h>
 #include <pcl/common/transforms.h>
+
+#include <gsl/gsl_multimin.h>
 
 #define DEFAULT_PATCH_SIZE 5
 #define IMAGE_WIDTH 1024
@@ -183,7 +185,7 @@ private:
 class VelStereoMatcher
 {
 
-  cv::Scalar evalStereoError(const std::vector<std::vector<ProjectedStereo> >& proj_stereo)
+  float evalStereoError(const std::vector<std::vector<ProjectedStereo> >& proj_stereo)
   {
     cv::Scalar err;
     size_t len = 0;
@@ -198,11 +200,7 @@ class VelStereoMatcher
         }
       }
     }
-
-    cv::Scalar result;
-    cv::divide(err, len, result);
-
-    return result;
+    return err[0] / len;
   }
 
 public:
@@ -218,10 +216,10 @@ public:
 
   void addFrame(const std::string image_left_path, const std::string image_right_path, const std::string vel_scan_path)
   {
-    frames.push_back(DataFrame(image_left_path,image_right_path,vel_scan_path));
+    frames.push_back(DataFrame(image_left_path, image_right_path, vel_scan_path));
   }
 
-  cv::Scalar evalTform(const Eigen::Affine3f& tform, bool plot = false)
+  float evalTform(const Eigen::Affine3f& tform, bool plot = false)
   {
     this->stereo_prop.setLeftTform(tform);
     std::vector<std::vector<ProjectedStereo> > proj_stereo_frames;
@@ -244,6 +242,120 @@ public:
 
     }
     return evalStereoError(proj_stereo_frames);
+  }
+
+  double static optFuncWrapper(const gsl_vector *v, void *params)
+  {
+    //evaluate
+    VelStereoMatcher* curr = static_cast<VelStereoMatcher*>(params);
+    return curr->evalTform(vecToTform(v));
+  }
+
+  static gsl_vector* tformToVec(const Eigen::Affine3f tform)
+  {
+
+    Eigen::Vector3f tran;
+    tran = tform.translation();
+    float x = tran[0];
+    float y = tran[1];
+    float z = tran[2];
+
+    Eigen::Matrix3f mat = tform.rotation();
+    Eigen::AngleAxisf axis;
+    axis = mat;
+    float ax = axis.axis()[0] * axis.angle();
+    float ay = axis.axis()[1] * axis.angle();
+    float az = axis.axis()[2] * axis.angle();
+
+    gsl_vector* vec = gsl_vector_alloc(6);
+    gsl_vector_set(vec, 0, x);
+    gsl_vector_set(vec, 1, y);
+    gsl_vector_set(vec, 2, z);
+    gsl_vector_set(vec, 3, ax);
+    gsl_vector_set(vec, 4, ay);
+    gsl_vector_set(vec, 5, az);
+
+    return vec;
+
+  }
+
+  static Eigen::Affine3f vecToTform(const gsl_vector* vec)
+  {
+
+    float x = gsl_vector_get(vec, 0);
+    float y = gsl_vector_get(vec, 1);
+    float z = gsl_vector_get(vec, 2);
+    float ax = gsl_vector_get(vec, 3);
+    float ay = gsl_vector_get(vec, 4);
+    float az = gsl_vector_get(vec, 5);
+    float r = std::sqrt(ax * ax + ay * ay + az * az);
+
+    //normalize axis
+    ax /= r;
+    ay /= r;
+    az /= r;
+
+    //create tform
+    Eigen::Affine3f tform = Eigen::Affine3f::Identity();
+    tform.translation() << x, y, z;
+    tform.rotate(Eigen::AngleAxisf(r, Eigen::Vector3f(ax, ay, az)));
+
+    return tform;
+
+  }
+
+  int findOptimalTform(Eigen::Affine3f init)
+  {
+
+    const gsl_multimin_fminimizer_type *T = gsl_multimin_fminimizer_nmsimplex2;
+    gsl_multimin_fminimizer *s = NULL;
+    gsl_vector *ss, *x;
+    gsl_multimin_function minex_func;
+
+    size_t iter = 0;
+    int status;
+    double size;
+
+    /* Starting point */
+    x = tformToVec(init);
+
+    /* Set initial step sizes to 1 */
+    ss = gsl_vector_alloc(6);
+    gsl_vector_set_all(ss, 1.0);
+
+    /* Initialize method and iterate */
+    minex_func.n = 6;
+    minex_func.f = this->optFuncWrapper;
+    minex_func.params = this;
+
+    s = gsl_multimin_fminimizer_alloc(T, 6);
+    gsl_multimin_fminimizer_set(s, &minex_func, x, ss);
+
+    do
+    {
+      iter++;
+      status = gsl_multimin_fminimizer_iterate(s);
+
+      if (status)
+        break;
+
+      size = gsl_multimin_fminimizer_size(s);
+      status = gsl_multimin_test_size(size, 1e-2);
+
+      if (status == GSL_SUCCESS)
+      {
+        printf("converged to minimum at\n");
+      }
+
+      printf("%5d %10.3e %10.3e f() = %7.3f size = %.3f\n", iter, gsl_vector_get(s->x, 0), gsl_vector_get(s->x, 1),
+             s->fval, size);
+    } while (status == GSL_CONTINUE && iter < 100);
+
+    gsl_vector_free (x);
+    gsl_vector_free(ss);
+    gsl_multimin_fminimizer_free(s);
+
+    return status;
   }
 
   void PlotProject(std::vector<ProjectedStereo> projected, cv::Mat image_left, cv::Mat image_right)
@@ -275,10 +387,10 @@ public:
     cv::dilate(vel_image_right, vel_image_right, cv::Mat(), cv::Point(-1, -1), 2, 1, 1);
 
     image_left /= 2;
-    image_left += 2*vel_image_left;
+    image_left += 2 * vel_image_left;
 
     image_right /= 2;
-    image_right += 2*vel_image_right;
+    image_right += 2 * vel_image_right;
 
     cv::namedWindow("left window", cv::WINDOW_AUTOSIZE);
     cv::imshow("left window", image_left);
@@ -295,7 +407,8 @@ public:
     tform.rotate(Eigen::AngleAxisf(-M_PI / 2, Eigen::Vector3f::UnitY()));
     tform.rotate(Eigen::AngleAxisf(-0.9, Eigen::Vector3f::UnitZ()));
 
-    evalTform(tform, true);
+    auto v = evalTform(tform, false);
+    std::cout << v << std::endl;
   }
 };
 
