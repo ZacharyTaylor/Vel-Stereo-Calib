@@ -27,3 +27,15 @@
 *.out
 *.app
 /Debug/
+/Release/
+
+#Doxygen
+/src/html/
+/src/latex/
+
+#Eclipse
+.cproject
+.project
+
+#Temp files
+*~
